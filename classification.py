@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 
 from LSTM_model import LSTM_classification, FocalLoss
@@ -14,7 +14,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-df = pd.read_csv("ogd-smn_gve_h_historical_2010-2019.csv", sep=";")
+df1 = pd.read_csv("ogd-smn_gve_h_historical_2000-2009.csv", sep=";")
+df2 = pd.read_csv("ogd-smn_gve_h_historical_2010-2019.csv", sep=";")
+
+df = pd.concat([df1, df2], axis=0)
 
 conversion = {
     #'tre200h0' : '2m air T hourly mean',
@@ -42,14 +45,15 @@ df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.cos(
 df['wind WE component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.sin(np.radians(df['wind direction hourly mean'])))
 
 df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean'])
-#df['average temperature'] = df[['2m air T hourly mean', 'air T ground hourly mean']].mean(axis=1)
-#df = df.drop(columns=['2m air T hourly mean', 'air T ground hourly mean'])
 
+# se classi sbilanciate
 neg = df[df['cumulative precipitation'] == 0].shape[0]
 pos = df[df['cumulative precipitation'] != 0].shape[0]
 weight = neg / pos
 
-#df['cumulative precipitation'] = np.log1p(df['cumulative precipitation'])
+df['precipitation'] = (df['cumulative precipitation'] != 0).astype(int)
+
+df = df.drop(columns='cumulative precipitation')
 
 df = df.dropna()
 
@@ -61,35 +65,28 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print(f"Device: {device}")
 
-seq_len = 8 # in ore / tra 10 e 12 cambia poco
+seq_len = 10 # in ore / tra 10 e 12 cambia poco
 
 # selezione feature e target
-features = df.drop(columns=["cumulative precipitation", 'reference_timestamp']).values
-targets = df["cumulative precipitation"].values.reshape(-1,1)
+features = df.drop(columns=['reference_timestamp']).values
+targets = df["precipitation"].values.reshape(-1,1)
 
 # scaler
-feature_scaler = StandardScaler()
-target_scaler = StandardScaler()
+feature_scaler = MinMaxScaler()
 
 features_scaled = feature_scaler.fit_transform(features)
-targets_scaled = target_scaler.fit_transform(targets)
-
-# target binario non scalato
-targets_bin = (targets > 0)
 
 # creazione sequenze
 X = np.array([features_scaled[i:i+seq_len] for i in range(len(features_scaled)-seq_len)], dtype=np.float32)
-y = np.array([targets_scaled[i+seq_len] for i in range(len(targets_scaled)-seq_len)], dtype=np.float32).reshape(-1,1)
-
-y_bin = np.array([targets_bin[i+seq_len] for i in range(len(targets_bin)-seq_len)], dtype=np.float32).reshape(-1,1)
+y = np.array([targets[i+seq_len] for i in range(len(targets)-seq_len)], dtype=np.float32).reshape(-1,1)
 
 X_ori = X
-y_ori = y_bin
+y_ori = y
 
 # ---- PREPARAZIONE RESAMPLIG ----
 
-idx_rain = np.where(y_bin.flatten() == 1)[0]
-idx_no_rain = np.where(y_bin.flatten() == 0)[0]
+idx_rain = np.where(y.flatten() == 1)[0]
+idx_no_rain = np.where(y.flatten() == 0)[0]
 
 # Numero di esempi di pioggia
 n_rain = len(idx_rain)
@@ -104,11 +101,11 @@ np.random.shuffle(idx_balanced)
 
 # Sequenze e target binari bilanciati
 X = X[idx_balanced]
-y = y_bin[idx_balanced]
+y = y[idx_balanced]
 
 # -----------------------------------------------------------
 X_train_val, X_test, y_train_val, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+     X, y, test_size=0.2, random_state=42
 )
 
 X_train, X_test, y_train, y_test = train_test_split(
@@ -146,13 +143,13 @@ y_orig_test_torch = y_orig_test_torch.float()
 
 # -----------------------------------------------------------------------
 
-model = LSTM_classification(in_feat=8, hidden_size=128, num_layers=4, out_feat=1).to(device)
+model = LSTM_classification(in_feat=9, hidden_size=256, num_layers=3, out_feat=1).to(device)
 
 #pos_weight = torch.tensor()
 criterion = nn.BCEWithLogitsLoss()
 #criterion = FocalLoss()
 
-optimizer = optim.Adam(model.parameters(), lr=0.0001)
+optimizer = optim.Adam(model.parameters(), lr=0.00005)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.65)
 
 epochs = 1000
@@ -207,11 +204,11 @@ plt.show()
 preds_np  = preds_label.cpu().numpy()
 probs_np  = probs.cpu().numpy()
 
-precision = precision_score(y_test_bin, preds_np)
-recall    = recall_score(y_test_bin, preds_np)
-f1        = f1_score(y_test_bin, preds_np)
-roc_auc   = roc_auc_score(y_test_bin, preds_np)
-cm        = confusion_matrix(y_test_bin, preds_np)
+precision = precision_score(y_orig_test, preds_np)
+recall    = recall_score(y_orig_test, preds_np)
+f1        = f1_score(y_orig_test, preds_np)
+roc_auc   = roc_auc_score(y_orig_test, preds_np)
+cm        = confusion_matrix(y_orig_test, preds_np)
 
 print(f"Precision: {precision:.4f}")
 print(f"Recall:    {recall:.4f}")
@@ -221,7 +218,7 @@ print("Confusion Matrix:")
 print(cm)
 
 n = 1500
-y_true = df['cumulative precipitation'] # solo per vedere valori realistici
+y_true = df['precipitation'] # solo per vedere valori realistici
 y_rain = (y_true > 0)
 y_pred = val_preds.detach().cpu().numpy().flatten()
 y_pred = (y_pred > thres)
