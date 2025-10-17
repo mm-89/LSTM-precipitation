@@ -41,8 +41,8 @@ df = df.rename(columns=conversion)
 df["reference_timestamp"] = pd.to_datetime(df["reference_timestamp"], format="%d.%m.%Y %H:%M")
 
 # wind conversion
-df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.cos(np.radians(df['wind direction hourly mean'])))
-df['wind WE component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.sin(np.radians(df['wind direction hourly mean'])))
+df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.cos(np.radians(df['wind direction hourly mean']))
+df['wind WE component'] = df['wind speed (ms) hourly mean'] * np.sin(np.radians(df['wind direction hourly mean']))
 
 df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean'])
 
@@ -50,10 +50,6 @@ df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean
 neg = df[df['cumulative precipitation'] == 0].shape[0]
 pos = df[df['cumulative precipitation'] != 0].shape[0]
 weight = neg / pos
-
-df['precipitation'] = (df['cumulative precipitation'] != 0).astype(int)
-
-df = df.drop(columns='cumulative precipitation')
 
 df = df.dropna()
 
@@ -65,106 +61,79 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print(f"Device: {device}")
 
-seq_len = 10 # in ore / tra 10 e 12 cambia poco
+seq_len = 6 # in ore / tra 10 e 12 cambia poco
+
+df['cumulative precipitation'] = (df['cumulative precipitation'] > 0).astype(int)
 
 # selezione feature e target
-features = df.drop(columns=['reference_timestamp']).values
-targets = df["precipitation"].values.reshape(-1,1)
+X = df.drop(columns=['reference_timestamp']).values
+y = df["cumulative precipitation"].values.reshape(-1,1)
 
-# scaler
-feature_scaler = MinMaxScaler()
+# -------------------------------------------------
 
-features_scaled = feature_scaler.fit_transform(features)
+# Dividiamo prima in train e test (80% train, 20% test) per semplicità
+split_idx = int(len(X) * 0.8)
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
+
+X_scaler = MinMaxScaler()
+X_train_scaled = X_scaler.fit_transform(X_train)
+X_test_scaled = X_scaler.transform(X_test)
 
 # creazione sequenze
-X = np.array([features_scaled[i:i+seq_len] for i in range(len(features_scaled)-seq_len)], dtype=np.float32)
-y = np.array([targets[i+seq_len] for i in range(len(targets)-seq_len)], dtype=np.float32).reshape(-1,1)
+def create_sequences(X, y, seq_len):
+    Xs, ys = [], []
+    for i in range(len(X) - seq_len):
+        Xs.append(X[i:i+seq_len])
+        ys.append(y[i+seq_len])
+    return np.array(Xs), np.array(ys)
 
-X_ori = X
-y_ori = y
+X_train_t, y_train_t = create_sequences(X_train_scaled, y_train, seq_len)
+X_test_t, y_test_t = create_sequences(X_test_scaled, y_test, seq_len)
 
-# ---- PREPARAZIONE RESAMPLIG ----
 
-idx_rain = np.where(y.flatten() == 1)[0]
-idx_no_rain = np.where(y.flatten() == 0)[0]
+X_train_torch = torch.from_numpy(X_train_t).float().to(device)
+y_train_torch = torch.from_numpy(y_train_t).float().to(device)
 
-# Numero di esempi di pioggia
-n_rain = len(idx_rain)
-
-# Resample casuale dagli esempi no-pioggia per avere 50-50
-np.random.seed(42)
-idx_no_rain_resampled = np.random.choice(idx_no_rain, size=n_rain, replace=False)
-
-# Combina gli indici e mescola
-idx_balanced = np.concatenate([idx_rain, idx_no_rain_resampled])
-np.random.shuffle(idx_balanced)
-
-# Sequenze e target binari bilanciati
-X = X[idx_balanced]
-y = y[idx_balanced]
-
-# -----------------------------------------------------------
-X_train_val, X_test, y_train_val, y_test = train_test_split(
-     X, y, test_size=0.2, random_state=42
-)
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X_train_val, y_train_val, test_size=0.25, random_state=42
-)
-
-# -----------------------------------------------------------
-X_orig_train_val, X_orig_test_val, y_orig_train_val, y_orig_test_val = train_test_split(
-    X_ori, y_ori, test_size=0.2, random_state=42
-)
-
-X_orig_train, X_orig_test, y_orig_train, y_orig_test = train_test_split(
-    X_orig_train_val, y_orig_train_val, test_size=0.25, random_state=42
-)
-# -----------------------------------------------------------
-
-# conversione in tensori PyTorch CLASSIFICAZIONE
-X_train_torch = torch.from_numpy(X_train).to(device)
-X_test_torch = torch.from_numpy(X_test).to(device)
-
-X_orig_train_torch = torch.from_numpy(X_orig_train).to(device)
-X_orig_test_torch = torch.from_numpy(X_orig_test).to(device)
-
-y_train_torch = torch.from_numpy(y_train).to(device)
-y_test_torch = torch.from_numpy(y_test).to(device)
-
-y_orig_train_torch = torch.from_numpy(y_orig_train).to(device)
-y_orig_test_torch = torch.from_numpy(y_orig_test).to(device)
-
-# BCE vuole float...
-y_train_torch = y_train_torch.float()
-y_test_torch  = y_test_torch.float()
-y_orig_train_torch = y_orig_train_torch.float()
-y_orig_test_torch = y_orig_test_torch.float()
+X_test_torch = torch.from_numpy(X_test_t).float().to(device)
+y_test_torch = torch.from_numpy(y_test_t).float().to(device)
 
 # -----------------------------------------------------------------------
+save_model = True
+charge_model = False
 
-model = LSTM_classification(in_feat=9, hidden_size=256, num_layers=3, out_feat=1).to(device)
+model = LSTM_classification(in_feat=9, hidden_size=64, num_layers=3, out_feat=1).to(device)
 
-#pos_weight = torch.tensor()
-criterion = nn.BCEWithLogitsLoss()
-#criterion = FocalLoss()
+weight *= 1
+pos_weight = torch.tensor([weight], device=device)
+#criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+criterion = FocalLoss()
 
 optimizer = optim.Adam(model.parameters(), lr=0.00005)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.65)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.95)
 
-epochs = 1000
+epochs = 2000
 
-thres = 0.5
+thres = 0.56
 
-# backup
-# optimizer = optim.Adam(model.parameters(), lr=0.00005, weight_decay=3e-5)
-# scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.8)
-# epochs = 10000
-# thres = 0.7
+if charge_model:
+    checkpoint = torch.load('checkpoint.pth', weights_only=True)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    loss = checkpoint['loss']
+    print(f"Model charged, starts at epoch: {start_epoch}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load('checkpoint.pth', map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+else:
+    start_epoch = 0
 
 loss_tot = []
 val_loss_tot = []
-for epoch in range(epochs):
+for epoch in range(start_epoch, epochs):
     model.train()
     optimizer.zero_grad()
     out = model(X_train_torch)
@@ -178,37 +147,37 @@ for epoch in range(epochs):
     model.eval()
     with torch.no_grad():
 
-        val_out = model(X_orig_test_torch) # uso tutto il dataset originale
-        val_loss = criterion(val_out, y_orig_test_torch).item()
+        val_out = model(X_test_torch)
+        val_loss = criterion(val_out, y_test_torch).item()
         val_loss_tot.append(val_loss)
 
-        train_preds = torch.sigmoid(out).squeeze()
-        train_acc = ((train_preds > thres).float() == y_train_torch.squeeze()).float().mean().item()
-        
-        val_preds = torch.sigmoid(val_out).squeeze()
-        val_acc = ((val_preds > thres).float() == y_orig_test_torch.squeeze()).float().mean().item()
+        train_probs = torch.sigmoid(out).squeeze(-1)
+        train_preds = (train_probs > thres).int()
+        train_acc = (train_preds == y_train_torch.squeeze(-1)).float().mean().item()
 
-        probs = torch.sigmoid(val_out).squeeze()         # (N,)
-        preds_label = (probs > thres).int()
-        
+        val_probs = torch.sigmoid(val_out).squeeze(-1)
+        val_preds = (val_probs > thres).int()
+        val_acc = (val_preds == y_test_torch.squeeze(-1)).float().mean().item()
+
     if epoch % 100 == 0:
         print(f"Epoch {epoch}, Loss train: {loss.item():.4f}, loss test: {val_loss}; Train Acc: {train_acc:.4f}. Val Acc: {val_acc:.4f}")
 
-    #scheduler.step()
+    scheduler.step()
 plt.plot(np.arange(len(loss_tot)), loss_tot, label='train')
 plt.plot(np.arange(len(val_loss_tot)), val_loss_tot, label='test')
 plt.legend()
 plt.show()
 
 # --- Calcolo metriche ---
-preds_np  = preds_label.cpu().numpy()
-probs_np  = probs.cpu().numpy()
+preds_np = val_preds.cpu().numpy()  # labels binarie
+probs_np = val_probs.cpu().numpy()  # probabilità continue
 
-precision = precision_score(y_orig_test, preds_np)
-recall    = recall_score(y_orig_test, preds_np)
-f1        = f1_score(y_orig_test, preds_np)
-roc_auc   = roc_auc_score(y_orig_test, preds_np)
-cm        = confusion_matrix(y_orig_test, preds_np)
+# metriche
+precision = precision_score(y_test_t.ravel(), preds_np)
+recall    = recall_score(y_test_t.ravel(), preds_np)
+f1        = f1_score(y_test_t.ravel(), preds_np)
+roc_auc   = roc_auc_score(y_test_t.ravel(), probs_np)
+cm        = confusion_matrix(y_test_t.ravel(), preds_np)
 
 print(f"Precision: {precision:.4f}")
 print(f"Recall:    {recall:.4f}")
@@ -217,16 +186,50 @@ print(f"ROC-AUC:   {roc_auc:.4f}")
 print("Confusion Matrix:")
 print(cm)
 
-n = 1500
-y_true = df['precipitation'] # solo per vedere valori realistici
-y_rain = (y_true > 0)
+n = 5000
+y_true = df['cumulative precipitation']
+y_true = y_true[int(len(X) * 0.8):]
 y_pred = val_preds.detach().cpu().numpy().flatten()
-y_pred = (y_pred > thres)
 
 plt.figure(figsize=(12,5))
-plt.bar(np.arange(n), y_rain[:n], color='skyblue', alpha=0.5, label="TRUE")
+plt.bar(np.arange(n), y_true[:n], color='skyblue', alpha=0.5, label="TRUE")
 plt.bar(np.arange(n), y_pred[:n], color='red', alpha=0.2, label="PRED")
 plt.xlabel("Campioni")
 plt.ylabel("Residuo")
 plt.legend()
 plt.show()
+
+import numpy as np
+from sklearn.metrics import precision_recall_curve, f1_score
+
+# y_true = etichette reali (0/1)
+# y_scores = probabilità previste dal modello (output di predict_proba[:, 1] o decision_function)
+# esempio:
+# y_true = np.array([...])
+# y_scores = np.array([...])
+
+# Calcola precision, recall e soglie
+precision, recall, thresholds = precision_recall_curve(y_test_t.ravel(), probs_np)
+
+# Calcola F1 per ogni soglia
+f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
+
+# Trova la soglia che massimizza l'F1-score
+idx = np.argmax(f1)
+best_threshold = thresholds[idx]
+best_f1 = f1[idx]
+
+print(f"Soglia ottimale: {best_threshold:.3f}")
+print(f"F1 ottimale: {best_f1:.3f}")
+print(f"Precisione a soglia ottimale: {precision[idx]:.3f}")
+print(f"Recall a soglia ottimale: {recall[idx]:.3f}")
+
+# SALVIAMO il modello
+if save_model:
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+        'scheduler' : scheduler,
+    }, 'checkpoint.pth')

@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import QuantileTransformer
 
 from LSTM_model import LSTM_regression
 from LSTMJOIN_model import LSTM_MultiTask
@@ -47,17 +48,11 @@ df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean
 # df['average temperature'] = df[['2m air T hourly mean', 'air T ground hourly mean']].mean(axis=1)
 # df = df.drop(columns=['2m air T hourly mean', 'air T ground hourly mean'])
 
-df['cumulative precipitation'] = np.log1p(df['cumulative precipitation'])
-
-df.hist('cumulative precipitation', bins=20)
-plt.ylim(0, 20)
-plt.show()
-
-# --- LOG TRANSF ---
+# con quantitle transfromation non c'è bisogno di log transform
+# df['cumulative precipitation'] = np.log1p(df['cumulative precipitation'])
 
 print(f"Max value for prec: {df['cumulative precipitation'].max()}, Min value for prec: {df['cumulative precipitation'].min()}")
 print(f"Mean: {df['cumulative precipitation'].mean()}, std: {df['cumulative precipitation'].std()}")
-
 
 df = df.dropna()
 
@@ -71,64 +66,78 @@ print(f"Device: {device}")
 
 seq_len = 6 # in ore / tra 10 e 12 cambia poco
 
+# aggiungo rumore gaussiano alla precipitazione ----------------
+df['cumulative precipitation'] += np.random.normal(0, 1e-3, size=(df['cumulative precipitation'].shape))
+# --------------------------------------------------------------
+
+# prendo il subset dove precipitation è > 0
+df = df[df['cumulative precipitation'] > 0]
+
 # selezione feature e target
-features = df.drop(columns=['reference_timestamp']).values
-targets = df["cumulative precipitation"].values.reshape(-1,1)
+X = df.drop(columns=['reference_timestamp']).values
+y = df["cumulative precipitation"].values.reshape(-1,1)
 
-# scaler
-feature_scaler = MinMaxScaler()
-target_scaler = MinMaxScaler()
+# Dividiamo prima in train e test (80% train, 20% test) per semplicità
+split_idx = int(len(X) * 0.8)
+X_train, X_test = X[:split_idx], X[split_idx:]
+y_train, y_test = y[:split_idx], y[split_idx:]
 
-features_scaled = feature_scaler.fit_transform(features)
-targets_scaled = target_scaler.fit_transform(targets)
+X_scaler = MinMaxScaler()
+y_scaler = QuantileTransformer(output_distribution='normal', n_quantiles=1000)
 
-# target binario non scalato
-targets_bin = (targets > 0.1)
-y_bin = np.array([targets_bin[i+seq_len] for i in range(len(targets_bin)-seq_len)], dtype=np.float32).reshape(-1,1)
+X_train_scaled = X_scaler.fit_transform(X_train)
+y_train_scaled = y_scaler.fit_transform(y_train)
 
-# creazione sequenze
-X = np.array([features_scaled[i:i+seq_len] for rain, i in zip(y_bin, range(len(features_scaled)-seq_len)) if rain], dtype=np.float32)
+# trasformo i rispettivi TEST set
+X_test_scaled = X_scaler.transform(X_test)
+y_test_scaled = y_scaler.transform(y_test)
 
-y = np.array([targets_scaled[i+seq_len] for rain, i in zip(y_bin, range(len(targets_scaled)-seq_len)) if rain], dtype=np.float32).reshape(-1,1)
+# print(y_test_scaled.min(), y_test_scaled.max())
+# print(y_train_scaled.min(), y_train_scaled.max())
 
-# Dividiamo prima in train+val e test (80% train+val, 20% test)
-X_train_val, X_test, y_train_val, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
+def create_sequences(X, y, seq_len):
+    Xs, ys = [], []
+    for i in range(len(X) - seq_len):
+        Xs.append(X[i:i+seq_len])
+        ys.append(y[i+seq_len])
+    return np.array(Xs), np.array(ys)
 
-X_train, X_val, y_train, y_val = train_test_split(
-    X_train_val, y_train_val, test_size=0.25, random_state=42
-)
+X_train_t, y_train_t = create_sequences(X_train_scaled, y_train, seq_len)
+X_test_t, y_test_t = create_sequences(X_test_scaled, y_test, seq_len)
 
-# conversione in tensori PyTorch
-X_train_torch = torch.from_numpy(X_train).to(device)
-y_train_torch = torch.from_numpy(y_train).to(device)
+X_train_torch = torch.from_numpy(X_train_t).float().to(device)
+y_train_torch = torch.from_numpy(y_train_t).float().to(device)
 
-X_test_torch = torch.from_numpy(X_test).to(device)
-y_test_torch = torch.from_numpy(y_test).to(device)
+X_test_torch = torch.from_numpy(X_test_t).float().to(device)
+y_test_torch = torch.from_numpy(y_test_t).float().to(device)
+
+# check visivo gaussianità --------------------------------------
+# plt.figure(figsize=(10,5))
+# plt.hist(y_train_scaled, bins=100, color='skyblue', edgecolor='black')
+# plt.title("Distribuzione della pioggia dopo QuantileTransformer")
+# plt.xlabel("Valore trasformato")
+# plt.ylabel("Frequenza")
+# plt.show()
+# # ----------------------------------------------------------------
 
 # --------------------------------------------------------------------
 
-model = LSTM_regression(in_feat=9, hidden_size=256, num_layers=3, out_feat=1).to(device)
-
-#criterion = nn.MSELoss()
-criterion = nn.SmoothL1Loss()
-optimizer = optim.Adam(model.parameters(), lr=0.005)
+model = LSTM_regression(in_feat=9, hidden_size=64, num_layers=3, out_feat=1).to(device)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0005)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.9)
+nn.init.xavier_uniform_(model.fc.weight)
 
 epochs = 1000
 
-train_loss_tot = []
-test_loss_tot = []
-
-train_rmse_tot = []
-test_rmse_tot = []
+train_loss_tot, test_loss_tot = [], []
+train_rmse_tot, test_rmse_tot = [], []
 
 for epoch in range(epochs):
     model.train()
     optimizer.zero_grad()
-    out = model(X_train_torch)
-    loss = criterion(out, y_train_torch)
+    train_out = model(X_train_torch)
+    loss = criterion(train_out, y_train_torch)
     loss.backward()
 
     optimizer.step()
@@ -137,29 +146,30 @@ for epoch in range(epochs):
 
     model.eval()
     with torch.no_grad():
+        test_out = model(X_test_torch)
+        test_loss = criterion(test_out, y_test_torch)
+        test_loss_tot.append(test_loss.item())
 
-        val_out = model(X_test_torch)
-        val_loss = criterion(val_out, y_test_torch).item()
-        test_loss_tot.append(val_loss)
+        # Converti in NumPy
+        y_pred_train = train_out.cpu().numpy()
+        y_true_train = y_train_torch.cpu().numpy()
+        y_pred_test = test_out.cpu().numpy()
+        y_true_test = y_test_torch.cpu().numpy()
 
-        y_pred_test = val_out.cpu().numpy()
-        y_pred_test = target_scaler.inverse_transform(y_pred_test)
-        y_true_test = target_scaler.inverse_transform(y_test)
+        # Inverse transform
+        y_pred_train = y_scaler.inverse_transform(y_pred_train)
+        y_true_train = y_scaler.inverse_transform(y_true_train)
+        y_pred_test = y_scaler.inverse_transform(y_pred_test)
+        y_true_test = y_scaler.inverse_transform(y_true_test)
 
-        y_pred_train = out.cpu().numpy()
-        y_pred_train = target_scaler.inverse_transform(y_pred_train)
-        y_true_train = target_scaler.inverse_transform(y_train)
-
-        mse_test = np.mean((np.expm1(y_pred_test) - np.expm1(y_true_test))** 2)
-        rmse_test = mse_test ** 0.5
-        test_rmse_tot.append(rmse_test)
-
-        mse_train =  np.mean((np.expm1(y_pred_train) - np.expm1(y_true_train))** 2)
-        rmse_train = mse_train ** 0.5
+        # Calcolo RMSE
+        rmse_train = np.sqrt(np.mean((y_pred_train - y_true_train)**2))
+        rmse_test = np.sqrt(np.mean((y_pred_test - y_true_test)**2))
         train_rmse_tot.append(rmse_train)
+        test_rmse_tot.append(rmse_test)
         
     if epoch % 100 == 0:
-        print(f"Epoch {epoch}, Loss train: {loss.item():.4f}, Loss test: {val_loss:.4f}. RMSE train: {rmse_train:.4f}, RMSE test: {rmse_test:.4f}")
+        print(f"Epoch {epoch}, Loss train: {loss.item():.4f}, Loss test: {test_loss:.4f}. RMSE train: {rmse_train:.4f}, RMSE test: {rmse_test:.4f}")
 
         # if last_loss <= val_loss: break
         # else: last_loss = val_loss
@@ -167,12 +177,8 @@ for epoch in range(epochs):
     scheduler.step()
 
 n = 2000
-residuals = (y_test_torch - val_out).detach().cpu().numpy()
-
-residuals_np = residuals[:n].flatten()
-
 y_true = y_test_torch.detach().cpu().numpy().flatten()
-y_pred = val_out.detach().cpu().numpy().flatten()
+y_pred = test_out.detach().cpu().numpy().flatten()
 
 plt.figure(figsize=(12,5))
 plt.bar(np.arange(n), y_true[:n], color='skyblue', alpha=0.5, label="TRUE")
@@ -180,7 +186,6 @@ plt.bar(np.arange(n), y_pred[:n], color='red', alpha=0.5, label="PRED")
 plt.xlabel("Campioni")
 plt.ylabel("Residuo")
 plt.legend()
-plt.title(f"Residui (primi {len(residuals_np)} campioni)")
 plt.show()
 
 plt.plot(np.arange(len(train_loss_tot)), train_loss_tot, label='LOSS train')
