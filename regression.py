@@ -41,10 +41,10 @@ df = df.rename(columns=conversion)
 df["reference_timestamp"] = pd.to_datetime(df["reference_timestamp"], format="%d.%m.%Y %H:%M")
 
 # wind conversion
-df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.cos(np.radians(df['wind direction hourly mean'])))
-df['wind WE component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.sin(np.radians(df['wind direction hourly mean'])))
+# df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.cos(np.radians(df['wind direction hourly mean'])))
+# df['wind WE component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.sin(np.radians(df['wind direction hourly mean'])))
 
-df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean'])
+# df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean'])
 # df['average temperature'] = df[['2m air T hourly mean', 'air T ground hourly mean']].mean(axis=1)
 # df = df.drop(columns=['2m air T hourly mean', 'air T ground hourly mean'])
 
@@ -102,8 +102,8 @@ def create_sequences(X, y, seq_len):
         ys.append(y[i+seq_len])
     return np.array(Xs), np.array(ys)
 
-X_train_t, y_train_t = create_sequences(X_train_scaled, y_train, seq_len)
-X_test_t, y_test_t = create_sequences(X_test_scaled, y_test, seq_len)
+X_train_t, y_train_t = create_sequences(X_train_scaled, y_train_scaled, seq_len)
+X_test_t, y_test_t = create_sequences(X_test_scaled, y_test_scaled, seq_len)
 
 X_train_torch = torch.from_numpy(X_train_t).float().to(device)
 y_train_torch = torch.from_numpy(y_train_t).float().to(device)
@@ -112,23 +112,22 @@ X_test_torch = torch.from_numpy(X_test_t).float().to(device)
 y_test_torch = torch.from_numpy(y_test_t).float().to(device)
 
 # check visivo gaussianità --------------------------------------
-# plt.figure(figsize=(10,5))
-# plt.hist(y_train_scaled, bins=100, color='skyblue', edgecolor='black')
-# plt.title("Distribuzione della pioggia dopo QuantileTransformer")
-# plt.xlabel("Valore trasformato")
-# plt.ylabel("Frequenza")
-# plt.show()
+plt.figure(figsize=(10,5))
+plt.hist(y_train_scaled, bins=100, color='skyblue', edgecolor='black')
+plt.title("Distribuzione della pioggia dopo QuantileTransformer")
+plt.xlabel("Valore trasformato")
+plt.ylabel("Frequenza")
+plt.show()
 # # ----------------------------------------------------------------
 
 # --------------------------------------------------------------------
 
 model = LSTM_regression(in_feat=9, hidden_size=64, num_layers=3, out_feat=1).to(device)
 criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.0005)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.9)
-nn.init.xavier_uniform_(model.fc.weight)
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.99)
 
-epochs = 1000
+epochs = 50
 
 train_loss_tot, test_loss_tot = [], []
 train_rmse_tot, test_rmse_tot = [], []
@@ -168,17 +167,20 @@ for epoch in range(epochs):
         train_rmse_tot.append(rmse_train)
         test_rmse_tot.append(rmse_test)
         
-    if epoch % 100 == 0:
+    #if epoch % 100 == 0:
         print(f"Epoch {epoch}, Loss train: {loss.item():.4f}, Loss test: {test_loss:.4f}. RMSE train: {rmse_train:.4f}, RMSE test: {rmse_test:.4f}")
 
         # if last_loss <= val_loss: break
         # else: last_loss = val_loss
 
-    scheduler.step()
+    #scheduler.step()
 
 n = 2000
-y_true = y_test_torch.detach().cpu().numpy().flatten()
-y_pred = test_out.detach().cpu().numpy().flatten()
+
+y_pred = y_scaler.inverse_transform(test_out.detach().cpu().numpy()).flatten()
+y_true = y_scaler.inverse_transform(y_test_torch.detach().cpu().numpy()).flatten()
+
+print(y_true[:n])
 
 plt.figure(figsize=(12,5))
 plt.bar(np.arange(n), y_true[:n], color='skyblue', alpha=0.5, label="TRUE")
@@ -188,9 +190,24 @@ plt.ylabel("Residuo")
 plt.legend()
 plt.show()
 
+plt.figure(figsize=(12,5))
+plt.bar(np.arange(n),
+        y_scaler.transform(y_true_test[:n].reshape(-1, 1)).ravel(),
+        color='skyblue', alpha=0.5, label="TRUE")
+plt.bar(np.arange(n),
+        y_scaler.transform(y_pred_test[:n].reshape(-1, 1)).ravel(),
+        color='red', alpha=0.5, label="PRED")
+plt.xlabel("Campioni")
+plt.ylabel("Residuo (scalato)")
+plt.legend()
+plt.show()
+
+
 plt.plot(np.arange(len(train_loss_tot)), train_loss_tot, label='LOSS train')
 plt.plot(np.arange(len(test_loss_tot)), test_loss_tot, label='LOSS test')
-# plt.plot(np.arange(len(train_rmse_tot)), train_rmse_tot, label='RMSE train')
-# plt.plot(np.arange(len(test_rmse_tot)), test_rmse_tot, label='RMSE test')
+plt.legend()
+plt.show()
+plt.plot(np.arange(len(train_rmse_tot)), train_rmse_tot, label='RMSE train')
+plt.plot(np.arange(len(test_rmse_tot)), test_rmse_tot, label='RMSE test')
 plt.legend()
 plt.show()
