@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -9,28 +10,44 @@ from sklearn.model_selection import train_test_split
 from LSTM_model import LSTM_classification, FocalLoss
 from LSTMJOIN_model import LSTM_MultiTask
 
+from sklearn.utils import resample
+from collections import Counter
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-df1 = pd.read_csv("ogd-smn_gve_h_historical_2000-2009.csv", sep=";")
-df2 = pd.read_csv("ogd-smn_gve_h_historical_2010-2019.csv", sep=";")
+#df1 = pd.read_csv("ogd-smn_gve_h_historical_2000-2009.csv", sep=";")
+df = pd.read_csv("ogd-smn_gve_h_historical_2010-2019.csv", sep=";")
 
-df = pd.concat([df1, df2], axis=0)
+#df = pd.concat([df1, df2], axis=0)
 
 conversion = {
-    #'tre200h0' : '2m air T hourly mean',
-    'tre005h0' : 'air T ground hourly mean',
-    'ure200h0' : '2m rel hum hourly mean',
-    'tde200h0' : 'dew point',
-    'prestah0' : 'atmospheric pressure (QFE)',
-    'dkl010h0' : 'wind direction hourly mean',
-    'fkl010h0' : 'wind speed (ms) hourly mean',
-    'rre150h0' : 'cumulative precipitation',
-    'gre000h0' : 'global irradiance',
-    'sre000h0' : 'total sunshine'
+    'tre005h0' : 'T', # temperatura ground
+    'ure200h0' : '2mRH',
+    'pva200h0' : '2mVP',
+    'tde200h0' : 'DP',
+    'prestah0' : 'QFE',
+    #'dkl010h0' : 'wind speed', 
+    #'fkl010h0' : 'wind direction',
+    'rre150h0' : 'precipitation',
+    'gre000h0' : 'irradiance',
+    #'sre000h0' : 'sunshine'
  }
+
+# conversion = {
+#     'tre005s0' : 'T', # temperatura ground
+#     'ure200s0' : '2mRH',
+#     'pva200s0' : '2mVP',
+#     'tde200s0' : 'DP',
+#     'prestas0' : 'QFE',
+#     #'dkl010z0' : 'wind speed', 
+#     #'fkl010z0' : 'wind direction',
+#     'rre150z0' : 'precipitation',
+#     'gre000z0' : 'irradiance',
+#     'sre000z0' : 'sunshine'
+#  }
 
 fets_sel = list(conversion.keys())
 fets_sel = ["reference_timestamp"] + fets_sel
@@ -38,17 +55,31 @@ fets_sel = ["reference_timestamp"] + fets_sel
 df = df[fets_sel]
 df = df.rename(columns=conversion)
 
-df["reference_timestamp"] = pd.to_datetime(df["reference_timestamp"], format="%d.%m.%Y %H:%M")
+# df['T_3h'] = df['T'].rolling(3).mean()
+df['precipitation_3h'] = df['precipitation'].rolling(6).min()
 
-# wind conversion
-df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.cos(np.radians(df['wind direction hourly mean']))
-df['wind WE component'] = df['wind speed (ms) hourly mean'] * np.sin(np.radians(df['wind direction hourly mean']))
+# df['dT'] = df['T'].diff(1)
+df['dP'] = df['QFE'].diff(1)
+df['dU'] = df['2mRH'].diff(1)
+# df['dTd'] = df['dP'].diff(1)
 
-df = df.drop(columns=['wind speed (ms) hourly mean', 'wind direction hourly mean'])
+#df['precipitation'] += np.random.normal(0, 1e-3, size=(df['precipitation'].shape))
+
+df['T'].plot()
+plt.show()
+
+corr = df.corr(numeric_only=True)
+
+# Crea la heatmap
+plt.figure(figsize=(10, 8))
+sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", square=True, cbar_kws={"shrink": 0.8})
+plt.title("Matrice di correlazione - df_graeua")
+plt.tight_layout()
+plt.show()
 
 # se classi sbilanciate
-neg = df[df['cumulative precipitation'] == 0].shape[0]
-pos = df[df['cumulative precipitation'] != 0].shape[0]
+neg = df[df['precipitation'] == 0].shape[0]
+pos = df[df['precipitation'] != 0].shape[0]
 weight = neg / pos
 
 df = df.dropna()
@@ -61,13 +92,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 print(f"Device: {device}")
 
-seq_len = 6 # in ore / tra 10 e 12 cambia poco
+seq_len = 5 # in ore / tra 10 e 12 cambia poco
 
-df['cumulative precipitation'] = (df['cumulative precipitation'] > 0).astype(int)
+df['precipitation'] = (df['precipitation'] > 0).astype(int)
 
 # selezione feature e target
 X = df.drop(columns=['reference_timestamp']).values
-y = df["cumulative precipitation"].values.reshape(-1,1)
+y = df["precipitation"].values.reshape(-1,1)
 
 # -------------------------------------------------
 
@@ -76,7 +107,7 @@ split_idx = int(len(X) * 0.8)
 X_train, X_test = X[:split_idx], X[split_idx:]
 y_train, y_test = y[:split_idx], y[split_idx:]
 
-X_scaler = MinMaxScaler()
+X_scaler = StandardScaler()
 X_train_scaled = X_scaler.fit_transform(X_train)
 X_test_scaled = X_scaler.transform(X_test)
 
@@ -91,7 +122,6 @@ def create_sequences(X, y, seq_len):
 X_train_t, y_train_t = create_sequences(X_train_scaled, y_train, seq_len)
 X_test_t, y_test_t = create_sequences(X_test_scaled, y_test, seq_len)
 
-
 X_train_torch = torch.from_numpy(X_train_t).float().to(device)
 y_train_torch = torch.from_numpy(y_train_t).float().to(device)
 
@@ -99,22 +129,23 @@ X_test_torch = torch.from_numpy(X_test_t).float().to(device)
 y_test_torch = torch.from_numpy(y_test_t).float().to(device)
 
 # -----------------------------------------------------------------------
-save_model = True
+save_model = False
 charge_model = False
 
-model = LSTM_classification(in_feat=9, hidden_size=64, num_layers=3, out_feat=1).to(device)
+model = LSTM_classification(in_feat=10, hidden_size=32, num_layers=1, out_feat=1).to(device)
 
 weight *= 1
 pos_weight = torch.tensor([weight], device=device)
 #criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 criterion = FocalLoss()
 
-optimizer = optim.Adam(model.parameters(), lr=0.00005)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.95)
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+#scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
-epochs = 2000
+epochs = 100
 
-thres = 0.56
+thres = 0.5
 
 if charge_model:
     checkpoint = torch.load('checkpoint.pth', weights_only=True)
@@ -122,6 +153,7 @@ if charge_model:
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     start_epoch = checkpoint['epoch'] + 1
     loss = checkpoint['loss']
+    scheduler = checkpoint['scheduler']
     print(f"Model charged, starts at epoch: {start_epoch}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -159,10 +191,11 @@ for epoch in range(start_epoch, epochs):
         val_preds = (val_probs > thres).int()
         val_acc = (val_preds == y_test_torch.squeeze(-1)).float().mean().item()
 
-    if epoch % 100 == 0:
+    #if epoch % 100 == 0:
         print(f"Epoch {epoch}, Loss train: {loss.item():.4f}, loss test: {val_loss}; Train Acc: {train_acc:.4f}. Val Acc: {val_acc:.4f}")
 
-    scheduler.step()
+    #scheduler.step()
+    
 plt.plot(np.arange(len(loss_tot)), loss_tot, label='train')
 plt.plot(np.arange(len(val_loss_tot)), val_loss_tot, label='test')
 plt.legend()
@@ -187,7 +220,7 @@ print("Confusion Matrix:")
 print(cm)
 
 n = 5000
-y_true = df['cumulative precipitation']
+y_true = df['precipitation']
 y_true = y_true[int(len(X) * 0.8):]
 y_pred = val_preds.detach().cpu().numpy().flatten()
 

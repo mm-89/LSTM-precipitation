@@ -7,29 +7,29 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import QuantileTransformer
 
-from LSTM_model import LSTM_regression
+from LSTM_model import LSTM_regression, QuantileLoss
 from LSTMJOIN_model import LSTM_MultiTask
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-df1 = pd.read_csv("ogd-smn_gve_h_historical_2000-2009.csv", sep=";")
-df2 = pd.read_csv("ogd-smn_gve_h_historical_2010-2019.csv", sep=";")
+#df1 = pd.read_csv("ogd-smn_gve_h_historical_2000-2009.csv", sep=";")
+df = pd.read_csv("ogd-smn_gve_h_historical_2010-2019.csv", sep=";")
 
-df = pd.concat([df1, df2], axis=0)
+#df = pd.concat([df1, df2], axis=0)
 
 conversion = {
-    #'tre200h0' : '2m air T hourly mean',
-    'tre005h0' : 'air T ground hourly mean',
-    'ure200h0' : '2m rel hum hourly mean',
-    'tde200h0' : 'dew point',
-    'prestah0' : 'atmospheric pressure (QFE)',
-    'dkl010h0' : 'wind direction hourly mean',
-    'fkl010h0' : 'wind speed (ms) hourly mean',
-    'rre150h0' : 'cumulative precipitation',
-    'gre000h0' : 'global irradiance',
-    'sre000h0' : 'total sunshine'
+    'tre005h0' : 'T', # temperatura ground
+    'ure200h0' : '2mRH',
+    'pva200h0' : '2mVP',
+    'tde200h0' : 'DP',
+    'prestah0' : 'QFE',
+    #'dkl010h0' : 'wind speed', 
+    #'fkl010h0' : 'wind direction',
+    'rre150h0' : 'precipitation',
+    'gre000h0' : 'irradiance',
+    #'sre000h0' : 'sunshine'
  }
 
 fets_sel = list(conversion.keys())
@@ -38,7 +38,11 @@ fets_sel = ["reference_timestamp"] + fets_sel
 df = df[fets_sel]
 df = df.rename(columns=conversion)
 
-df["reference_timestamp"] = pd.to_datetime(df["reference_timestamp"], format="%d.%m.%Y %H:%M")
+df['precipitation_3h'] = df['precipitation'].rolling(6).min()
+
+# df['dT'] = df['T'].diff(1)
+df['dP'] = df['QFE'].diff(1)
+df['dU'] = df['2mRH'].diff(1)
 
 # wind conversion
 # df['wind NS component'] = df['wind speed (ms) hourly mean'] * np.degrees(np.cos(np.radians(df['wind direction hourly mean'])))
@@ -51,8 +55,8 @@ df["reference_timestamp"] = pd.to_datetime(df["reference_timestamp"], format="%d
 # con quantitle transfromation non c'è bisogno di log transform
 # df['cumulative precipitation'] = np.log1p(df['cumulative precipitation'])
 
-print(f"Max value for prec: {df['cumulative precipitation'].max()}, Min value for prec: {df['cumulative precipitation'].min()}")
-print(f"Mean: {df['cumulative precipitation'].mean()}, std: {df['cumulative precipitation'].std()}")
+print(f"Max value for prec: {df['precipitation'].max()}, Min value for prec: {df['precipitation'].min()}")
+print(f"Mean: {df['precipitation'].mean()}, std: {df['precipitation'].std()}")
 
 df = df.dropna()
 
@@ -66,16 +70,19 @@ print(f"Device: {device}")
 
 seq_len = 6 # in ore / tra 10 e 12 cambia poco
 
+# prendo il subset dove precipitation è > 0
+df = df[df['precipitation'] > 0]
+
 # aggiungo rumore gaussiano alla precipitazione ----------------
-df['cumulative precipitation'] += np.random.normal(0, 1e-3, size=(df['cumulative precipitation'].shape))
+df['precipitation'] += np.random.normal(0, 1e-3, size=(df['precipitation'].shape))
 # --------------------------------------------------------------
 
 # prendo il subset dove precipitation è > 0
-df = df[df['cumulative precipitation'] > 0]
+df = df[df['precipitation'] > 0]
 
 # selezione feature e target
 X = df.drop(columns=['reference_timestamp']).values
-y = df["cumulative precipitation"].values.reshape(-1,1)
+y = df["precipitation"].values.reshape(-1,1)
 
 # Dividiamo prima in train e test (80% train, 20% test) per semplicità
 split_idx = int(len(X) * 0.8)
@@ -83,14 +90,18 @@ X_train, X_test = X[:split_idx], X[split_idx:]
 y_train, y_test = y[:split_idx], y[split_idx:]
 
 X_scaler = MinMaxScaler()
-y_scaler = QuantileTransformer(output_distribution='normal', n_quantiles=1000)
+#y_scaler = QuantileTransformer(output_distribution='normal', n_quantiles=1000)
+y_scaler = MinMaxScaler()
+
+y_train_scaled = np.log1p(y_train)
+y_test_scaled = np.log1p(y_test)
 
 X_train_scaled = X_scaler.fit_transform(X_train)
-y_train_scaled = y_scaler.fit_transform(y_train)
+y_train_scaled = y_scaler.fit_transform(y_train_scaled)
 
 # trasformo i rispettivi TEST set
 X_test_scaled = X_scaler.transform(X_test)
-y_test_scaled = y_scaler.transform(y_test)
+y_test_scaled = y_scaler.transform(y_test_scaled)
 
 # print(y_test_scaled.min(), y_test_scaled.max())
 # print(y_train_scaled.min(), y_train_scaled.max())
@@ -113,26 +124,44 @@ y_test_torch = torch.from_numpy(y_test_t).float().to(device)
 
 # check visivo gaussianità --------------------------------------
 plt.figure(figsize=(10,5))
-plt.hist(y_train_scaled, bins=100, color='skyblue', edgecolor='black')
+plt.hist(y_train_scaled, bins=1000, color='skyblue', edgecolor='black')
 plt.title("Distribuzione della pioggia dopo QuantileTransformer")
 plt.xlabel("Valore trasformato")
 plt.ylabel("Frequenza")
 plt.show()
 # # ----------------------------------------------------------------
-
+save_model = True
+charge_model = False
 # --------------------------------------------------------------------
 
-model = LSTM_regression(in_feat=9, hidden_size=64, num_layers=3, out_feat=1).to(device)
+model = LSTM_regression(in_feat=10, hidden_size=32, num_layers=1, out_feat=1).to(device)
 criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.01)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.99)
+optimizer = optim.Adam(model.parameters(), lr=0.1)
+#scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.7)
+scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.5, end_factor=0.1)
 
-epochs = 50
+epochs = 5000
+
+if charge_model:
+    checkpoint = torch.load('checkpoint.pth', weights_only=True)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    start_epoch = checkpoint['epoch'] + 1
+    loss = checkpoint['loss']
+    scheduler = checkpoint['scheduler']
+    print(f"Model charged, starts at epoch: {start_epoch}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load('checkpoint.pth', map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+else:
+    start_epoch = 0
 
 train_loss_tot, test_loss_tot = [], []
 train_rmse_tot, test_rmse_tot = [], []
 
-for epoch in range(epochs):
+for epoch in range(start_epoch, epochs):
     model.train()
     optimizer.zero_grad()
     train_out = model(X_train_torch)
@@ -155,11 +184,16 @@ for epoch in range(epochs):
         y_pred_test = test_out.cpu().numpy()
         y_true_test = y_test_torch.cpu().numpy()
 
-        # Inverse transform
         y_pred_train = y_scaler.inverse_transform(y_pred_train)
         y_true_train = y_scaler.inverse_transform(y_true_train)
         y_pred_test = y_scaler.inverse_transform(y_pred_test)
         y_true_test = y_scaler.inverse_transform(y_true_test)
+
+        # Inverse transform
+        y_pred_train = np.expm1(y_pred_train)
+        y_true_train = np.expm1(y_true_train)
+        y_pred_test = np.expm1(y_pred_test)
+        y_true_test = np.expm1(y_true_test)
 
         # Calcolo RMSE
         rmse_train = np.sqrt(np.mean((y_pred_train - y_true_train)**2))
@@ -173,14 +207,15 @@ for epoch in range(epochs):
         # if last_loss <= val_loss: break
         # else: last_loss = val_loss
 
-    #scheduler.step()
+    scheduler.step()
 
-n = 2000
+n = 1000
 
-y_pred = y_scaler.inverse_transform(test_out.detach().cpu().numpy()).flatten()
-y_true = y_scaler.inverse_transform(y_test_torch.detach().cpu().numpy()).flatten()
+#y_pred = y_scaler.inverse_transform(test_out.detach().cpu().numpy()).flatten()
+#y_true = y_scaler.inverse_transform(y_test_torch.detach().cpu().numpy()).flatten()
 
-print(y_true[:n])
+y_pred = test_out.detach().cpu().numpy().flatten()
+y_true = y_test_torch.detach().cpu().numpy().flatten()
 
 plt.figure(figsize=(12,5))
 plt.bar(np.arange(n), y_true[:n], color='skyblue', alpha=0.5, label="TRUE")
@@ -211,3 +246,11 @@ plt.plot(np.arange(len(train_rmse_tot)), train_rmse_tot, label='RMSE train')
 plt.plot(np.arange(len(test_rmse_tot)), test_rmse_tot, label='RMSE test')
 plt.legend()
 plt.show()
+
+if save_model:
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+    }, 'checkpoint.pth')
